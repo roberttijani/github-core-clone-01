@@ -25,15 +25,24 @@ import {
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
+let reqCounter = 0;
+const REQ_PREFIX = `${Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0')}:`;
+
+function getRequestId(): string {
+  return `${REQ_PREFIX}${(++reqCounter).toString(16)}`;
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': createHash('sha256').update(String(Math.random()) + String(Date.now())).digest('hex').slice(0, 32),
+    'content-length': buf.length,
+    'x-github-request-id': getRequestId(),
+    'connection': 'keep-alive',
     ...extraHeaders,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 function sendText(res: ServerResponse, status: number, contentType: string, body: Buffer | string, extraHeaders: Record<string, string> = {}): void {
@@ -41,16 +50,20 @@ function sendText(res: ServerResponse, status: number, contentType: string, body
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': buf.length,
-    'x-github-request-id': createHash('sha256').update(String(Math.random()) + String(Date.now())).digest('hex').slice(0, 32),
+    'x-github-request-id': getRequestId(),
+    'connection': 'keep-alive',
     ...extraHeaders,
   });
   res.end(buf);
 }
 
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  return Buffer.concat(chunks);
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<{ ok: true; data: any } | { ok: false; raw: string }> {
@@ -98,6 +111,19 @@ interface ForgeIssue {
   created_at: string;
   updated_at: string;
   comments: ForgeComment[];
+  _cachedBuffer?: Buffer;
+}
+
+function serializeIssue(issue: ForgeIssue): Buffer {
+  const data = {
+    id: issue.id,
+    number: issue.number,
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    labels: issue.labels,
+  };
+  return Buffer.from(`${JSON.stringify(data)}\n`, 'utf8');
 }
 
 interface ForgePull {
@@ -133,6 +159,9 @@ interface ForgeRepo {
   pulls: Map<number, ForgePull>;
   pullSeq: number;
   commentsSeq: number;
+  commitParents: Map<string, string[]>;
+  treeEntries: Map<string, TreeEntry[]>;
+  shallowPackCache: Map<string, Buffer>;
 }
 
 class ForgeStore {
@@ -173,6 +202,9 @@ class ForgeStore {
       pulls: new Map(),
       pullSeq: 0,
       commentsSeq: 0,
+      commitParents: new Map(),
+      treeEntries: new Map(),
+      shallowPackCache: new Map(),
     };
     this.repos.set(this.repoKey(this.viewer.login, name), repo);
     return repo;
@@ -196,9 +228,13 @@ class ForgeStore {
 // ---------------------------------------------------------------------------
 
 function getTreeEntries(repo: ForgeRepo, treeOid: string): TreeEntry[] {
+  let cached = repo.treeEntries.get(treeOid);
+  if (cached) return cached;
   const obj = repo.objects.get(treeOid);
   if (!obj || obj.type !== 'tree') return [];
-  return parseTree(obj.data);
+  cached = parseTree(obj.data);
+  repo.treeEntries.set(treeOid, cached);
+  return cached;
 }
 
 function findEntryInTree(repo: ForgeRepo, treeOid: string, filePath: string): { oid: string; mode: string } | null {
@@ -277,6 +313,7 @@ function updateTreeWithFile(
     const treeData = buildTree(entries);
     const oid = hashObject('tree', treeData);
     repo.objects.set(oid, { type: 'tree', data: treeData });
+    repo.treeEntries.set(oid, entries);
     return oid;
   };
 
@@ -300,6 +337,7 @@ function createCommit(
   });
   const oid = hashObject('commit', commitData);
   repo.objects.set(oid, { type: 'commit', data: commitData });
+  repo.commitParents.set(oid, parents);
   return oid;
 }
 
@@ -313,13 +351,23 @@ function collectReachableOids(repo: ForgeRepo, tips: Iterable<string>, stopOids 
     const obj = repo.objects.get(oid);
     if (!obj) continue;
     if (obj.type === 'commit') {
-      const commit = parseCommit(obj.data);
-      if (commit.tree && !reachable.has(commit.tree)) queue.push(commit.tree);
-      for (const p of commit.parents) {
+      let parents = repo.commitParents.get(oid);
+      let treeOid: string | undefined;
+      if (!parents) {
+        const commit = parseCommit(obj.data);
+        parents = commit.parents;
+        treeOid = commit.tree;
+        repo.commitParents.set(oid, parents);
+      } else {
+        const match = obj.data.toString('ascii', 0, 100).match(/^tree ([0-9a-f]{40})/m);
+        if (match) treeOid = match[1];
+      }
+      if (treeOid && !reachable.has(treeOid)) queue.push(treeOid);
+      for (const p of parents) {
         if (!reachable.has(p)) queue.push(p);
       }
     } else if (obj.type === 'tree') {
-      const entries = parseTree(obj.data);
+      const entries = getTreeEntries(repo, oid);
       for (const e of entries) {
         if (!reachable.has(e.oid)) queue.push(e.oid);
       }
@@ -333,8 +381,9 @@ function collectReachableOids(repo: ForgeRepo, tips: Iterable<string>, stopOids 
 }
 
 function isFastForward(repo: ForgeRepo, oldOid: string, newOid: string): boolean {
-  if (oldOid === ZERO_OID) return true;
-  if (oldOid === newOid) return true;
+  if (oldOid === ZERO_OID || oldOid === newOid) return true;
+  const directParents = repo.commitParents.get(newOid);
+  if (directParents && directParents.includes(oldOid)) return true;
   const visited = new Set<string>();
   const queue = [newOid];
   while (queue.length > 0) {
@@ -342,10 +391,17 @@ function isFastForward(repo: ForgeRepo, oldOid: string, newOid: string): boolean
     if (curr === oldOid) return true;
     if (visited.has(curr)) continue;
     visited.add(curr);
-    const obj = repo.objects.get(curr);
-    if (obj && obj.type === 'commit') {
-      const commit = parseCommit(obj.data);
-      for (const p of commit.parents) queue.push(p);
+    let parents = repo.commitParents.get(curr);
+    if (!parents) {
+      const obj = repo.objects.get(curr);
+      if (obj && obj.type === 'commit') {
+        const commit = parseCommit(obj.data);
+        parents = commit.parents;
+        repo.commitParents.set(curr, parents);
+      }
+    }
+    if (parents) {
+      for (const p of parents) queue.push(p);
     }
   }
   return false;
@@ -358,9 +414,14 @@ function isFastForward(repo: ForgeRepo, oldOid: string, newOid: string): boolean
 export function createApp(): Server {
   const store = new ForgeStore();
 
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    const urlObj = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
-    const pathname = urlObj.pathname;
+  const server = createServer({
+    keepAlive: true,
+    keepAliveInitialDelay: 0,
+    noDelay: true,
+  }, async (req: IncomingMessage, res: ServerResponse) => {
+    const rawUrl = req.url ?? '/';
+    const qIdx = rawUrl.indexOf('?');
+    const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
     const method = (req.method ?? 'GET').toUpperCase();
 
     // 1. Health Probe
@@ -368,6 +429,14 @@ export function createApp(): Server {
       sendJson(res, 200, { ok: true });
       return;
     }
+
+    let urlObjInstance: URL | null = null;
+    const getUrlObj = () => {
+      if (!urlObjInstance) {
+        urlObjInstance = new URL(rawUrl, `http://${req.headers.host || 'localhost'}`);
+      }
+      return urlObjInstance;
+    };
 
     // 2. Auth Helper
     const authHeader = req.headers.authorization;
@@ -390,7 +459,7 @@ export function createApp(): Server {
 
       // GET info/refs
       if (gitAction === 'info/refs' && method === 'GET') {
-        const service = urlObj.searchParams.get('service');
+        const service = getUrlObj().searchParams.get('service');
         const gitProto = req.headers['git-protocol'] as string | undefined;
 
         if (service === 'git-upload-pack') {
@@ -532,6 +601,18 @@ export function createApp(): Server {
             const depthMatch = lines.find((l) => l.startsWith('deepen '))?.slice(7).trim();
             const depth = depthMatch ? parseInt(depthMatch, 10) : null;
 
+            const isShallowClone = depth === 1 && wants.length === 1 && haves.length === 0;
+            const shallowCacheKey = isShallowClone ? `shallow1:${wants[0]}` : null;
+            if (shallowCacheKey) {
+              const cachedBuf = repo.shallowPackCache.get(shallowCacheKey);
+              if (cachedBuf) {
+                res.setHeader('content-type', 'application/x-git-upload-pack-result');
+                res.writeHead(200);
+                res.end(cachedBuf);
+                return;
+              }
+            }
+
             const shallowSet = new Set(clientShallows);
             const haveSet = new Set<string>();
             for (const h of haves) {
@@ -629,9 +710,13 @@ export function createApp(): Server {
             }
             outPackets.push(pktLineFlush());
 
+            const finalPackets = Buffer.concat(outPackets);
+            if (shallowCacheKey) {
+              repo.shallowPackCache.set(shallowCacheKey, finalPackets);
+            }
             res.setHeader('content-type', 'application/x-git-upload-pack-result');
             res.writeHead(200);
-            res.end(Buffer.concat(outPackets));
+            res.end(finalPackets);
             return;
           }
         } else {
@@ -735,6 +820,12 @@ export function createApp(): Server {
             const readRes = readPack(packBytes, { resolveBase: (oid) => repo.objects.get(oid) });
             for (const [oid, obj] of readRes.objects) {
               repo.objects.set(oid, obj);
+              if (obj.type === 'commit') {
+                try {
+                  const commit = parseCommit(obj.data);
+                  repo.commitParents.set(oid, commit.parents);
+                } catch {}
+              }
             }
           } catch (e: any) {
             const reportLines = [
@@ -970,6 +1061,7 @@ export function createApp(): Server {
             updated_at: new Date().toISOString(),
             comments: [],
           };
+          issue._cachedBuffer = serializeIssue(issue);
           repo.issues.set(issueNum, issue);
           const data = { id: issue.id, number: issue.number, title: issue.title, body: issue.body, state: issue.state };
           sendJson(res, 200, { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data } });
@@ -1285,6 +1377,7 @@ export function createApp(): Server {
             comments: [],
           };
           targetRepo.issues.set(num, issue);
+          issue._cachedBuffer = serializeIssue(issue);
           return { data: { createIssue: { issue: { id: Buffer.from(`issue:${num}`).toString('base64'), number: num } } } };
         }
 
@@ -1294,6 +1387,7 @@ export function createApp(): Server {
             for (const i of r.issues.values()) {
               if (Buffer.from(`issue:${i.number}`).toString('base64') === input.issueId) {
                 i.state = 'closed';
+                i._cachedBuffer = serializeIssue(i);
                 return { data: { closeIssue: { issue: { id: input.issueId, number: i.number, state: 'CLOSED' } } } };
               }
             }
@@ -1496,8 +1590,8 @@ export function createApp(): Server {
         }
 
         if (method === 'GET') {
-          const perPage = parseInt(urlObj.searchParams.get('per_page') || '30', 10);
-          const page = parseInt(urlObj.searchParams.get('page') || '1', 10);
+          const perPage = parseInt(getUrlObj().searchParams.get('per_page') || '30', 10);
+          const page = parseInt(getUrlObj().searchParams.get('page') || '1', 10);
 
           const allRepos = [...store.repos.values()].map((r) => ({
             id: r.id,
@@ -1516,7 +1610,7 @@ export function createApp(): Server {
 
           const extraHeaders: Record<string, string> = {};
           if (end < allRepos.length) {
-            const nextUrl = `${urlObj.origin}/api/v3/user/repos?per_page=${perPage}&page=${page + 1}`;
+            const nextUrl = `${getUrlObj().origin}/api/v3/user/repos?per_page=${perPage}&page=${page + 1}`;
             extraHeaders.link = `<${nextUrl}>; rel="next"`;
           }
           sendJson(res, 200, paged, extraHeaders);
@@ -1597,8 +1691,8 @@ export function createApp(): Server {
           sendJson(res, 201, {
             ref,
             node_id: Buffer.from(`ref:${ref}`).toString('base64'),
-            url: `${urlObj.origin}/api/v3/repos/${owner}/${repoName}/git/refs/${ref}`,
-            object: { sha, type: 'commit', url: `${urlObj.origin}/api/v3/repos/${owner}/${repoName}/git/commits/${sha}` },
+            url: `${getUrlObj().origin}/api/v3/repos/${owner}/${repoName}/git/refs/${ref}`,
+            object: { sha, type: 'commit', url: `${getUrlObj().origin}/api/v3/repos/${owner}/${repoName}/git/commits/${sha}` },
           });
           return;
         }
@@ -1610,7 +1704,7 @@ export function createApp(): Server {
             if (refName.startsWith('refs/heads/')) {
               branches.push({
                 name: refName.slice('refs/heads/'.length),
-                commit: { sha: oid, url: `${urlObj.origin}/api/v3/repos/${owner}/${repoName}/commits/${oid}` },
+                commit: { sha: oid, url: `${getUrlObj().origin}/api/v3/repos/${owner}/${repoName}/commits/${oid}` },
                 protected: false,
               });
             }
@@ -1620,7 +1714,7 @@ export function createApp(): Server {
             if (defOid) {
               branches.push({
                 name: repo.default_branch,
-                commit: { sha: defOid, url: `${urlObj.origin}/api/v3/repos/${owner}/${repoName}/commits/${defOid}` },
+                commit: { sha: defOid, url: `${getUrlObj().origin}/api/v3/repos/${owner}/${repoName}/commits/${defOid}` },
                 protected: false,
               });
             }
@@ -1631,7 +1725,7 @@ export function createApp(): Server {
 
         // GET /repos/{o}/{r}/commits
         if (subPath === 'commits' && method === 'GET') {
-          const targetRef = urlObj.searchParams.get('sha') || repo.default_branch;
+          const targetRef = getUrlObj().searchParams.get('sha') || repo.default_branch;
           const tip = repo.refs.get(`refs/heads/${targetRef}`) || repo.refs.get(targetRef) || targetRef;
           const commits: any[] = [];
           if (tip && repo.objects.has(tip)) {
@@ -1713,7 +1807,7 @@ export function createApp(): Server {
           }
 
           if (method === 'GET') {
-            const branch = urlObj.searchParams.get('ref') || repo.default_branch;
+            const branch = getUrlObj().searchParams.get('ref') || repo.default_branch;
             const branchRef = `refs/heads/${branch}`;
             const commitSha = repo.refs.get(branchRef) || repo.refs.get(branch) || (repo.objects.has(branch) ? branch : null);
             if (!commitSha || !repo.objects.has(commitSha)) {
@@ -1851,22 +1945,23 @@ export function createApp(): Server {
               updated_at: new Date().toISOString(),
               comments: [],
             };
+            const buf = serializeIssue(issue);
+            issue._cachedBuffer = buf;
             repo.issues.set(num, issue);
-            sendJson(res, 201, {
-              id: issue.id,
-              number: issue.number,
-              title: issue.title,
-              body: issue.body,
-              state: issue.state,
-              labels: issue.labels,
+            res.writeHead(201, {
+              'content-type': JSON_TYPE,
+              'content-length': buf.length,
+              'x-github-request-id': getRequestId(),
+              'connection': 'keep-alive',
             });
+            res.end(buf);
             return;
           }
 
           if (method === 'GET') {
-            const stateFilter = urlObj.searchParams.get('state') || 'open';
-            const sort = urlObj.searchParams.get('sort');
-            const direction = urlObj.searchParams.get('direction') || 'desc';
+            const stateFilter = getUrlObj().searchParams.get('state') || 'open';
+            const sort = getUrlObj().searchParams.get('sort');
+            const direction = getUrlObj().searchParams.get('direction') || 'desc';
 
             let list = [...repo.issues.values()];
             if (stateFilter !== 'all') {
@@ -1898,14 +1993,25 @@ export function createApp(): Server {
           }
 
           if (method === 'GET') {
-            sendJson(res, 200, {
-              id: issue.id,
-              number: issue.number,
-              title: issue.title,
-              body: issue.body,
-              state: issue.state,
-              labels: issue.labels,
+            if (issue._cachedBuffer) {
+              res.writeHead(200, {
+                'content-type': JSON_TYPE,
+                'content-length': issue._cachedBuffer.length,
+                'x-github-request-id': getRequestId(),
+                'connection': 'keep-alive',
+              });
+              res.end(issue._cachedBuffer);
+              return;
+            }
+            const buf = serializeIssue(issue);
+            issue._cachedBuffer = buf;
+            res.writeHead(200, {
+              'content-type': JSON_TYPE,
+              'content-length': buf.length,
+              'x-github-request-id': getRequestId(),
+              'connection': 'keep-alive',
             });
+            res.end(buf);
             return;
           }
 
@@ -1918,6 +2024,7 @@ export function createApp(): Server {
             if (parsed.data.state) issue.state = parsed.data.state;
             if (parsed.data.title) issue.title = parsed.data.title;
             if (parsed.data.body) issue.body = parsed.data.body;
+            issue._cachedBuffer = serializeIssue(issue);
             sendJson(res, 200, {
               id: issue.id,
               number: issue.number,
@@ -2004,7 +2111,7 @@ export function createApp(): Server {
           }
 
           if (method === 'GET') {
-            const stateFilter = urlObj.searchParams.get('state') || 'open';
+            const stateFilter = getUrlObj().searchParams.get('state') || 'open';
             let list = [...repo.pulls.values()];
             if (stateFilter !== 'all') {
               list = list.filter((p) => p.state === stateFilter);
@@ -2163,4 +2270,12 @@ export function createApp(): Server {
     // Default 404 for any other route
     sendJson(res, 404, { message: 'Not Found' });
   });
+
+  server.keepAliveTimeout = 120000;
+  server.headersTimeout = 125000;
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+
+  return server;
 }
