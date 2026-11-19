@@ -61,10 +61,40 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => {
+      if (chunks.length === 0) resolve(Buffer.alloc(0));
+      else if (chunks.length === 1) resolve(chunks[0]);
+      else resolve(Buffer.concat(chunks));
+    });
     req.on('error', reject);
   });
 }
+
+function encodeSideband1(text: string): Buffer {
+  const textLen = Buffer.byteLength(text, 'utf8');
+  const totalPayloadLen = 1 + textLen;
+  const pktLen = 4 + totalPayloadLen;
+  const hex = pktLen.toString(16).padStart(4, '0');
+  const buf = Buffer.allocUnsafe(pktLen);
+  buf.write(hex, 0, 4, 'ascii');
+  buf[4] = 1;
+  buf.write(text, 5, textLen, 'utf8');
+  return buf;
+}
+
+const UNPACK_OK_PKT = encodeSideband1('unpack ok\n');
+const PKT_FLUSH = Buffer.from('0000', 'ascii');
+const V2_UPLOAD_PACK_ADVERTISEMENT = Buffer.concat([
+  encodePktLines([
+    'version 2\n',
+    'agent=makefun-forge/1.0\n',
+    'ls-refs=peel symrefs unborn\n',
+    'fetch=shallow wait-for-done filter\n',
+    'server-option\n',
+    'object-format=sha1\n',
+  ]),
+  PKT_FLUSH,
+]);
 
 async function readJsonBody(req: IncomingMessage): Promise<{ ok: true; data: any } | { ok: false; raw: string }> {
   const buf = await readBody(req);
@@ -162,6 +192,12 @@ interface ForgeRepo {
   commitParents: Map<string, string[]>;
   treeEntries: Map<string, TreeEntry[]>;
   shallowPackCache: Map<string, Buffer>;
+  lsRefsCache: Map<string, Buffer>;
+}
+
+function invalidateRepoCache(repo: ForgeRepo): void {
+  repo.shallowPackCache.clear();
+  repo.lsRefsCache.clear();
 }
 
 class ForgeStore {
@@ -205,6 +241,7 @@ class ForgeStore {
       commitParents: new Map(),
       treeEntries: new Map(),
       shallowPackCache: new Map(),
+      lsRefsCache: new Map(),
     };
     this.repos.set(this.repoKey(this.viewer.login, name), repo);
     return repo;
@@ -446,7 +483,7 @@ export function createApp(): Server {
     // =======================================================================
     // Git Smart-HTTP Surface
     // =======================================================================
-    const gitMatch = pathname.match(/^\/([^\/]+)\/([^\/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/);
+    const gitMatch = pathname.includes('.git/') ? pathname.match(/^\/([^\/]+)\/([^\/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/) : null;
     if (gitMatch) {
       const [, owner, repoName, gitAction] = gitMatch;
       const repo = store.getRepo(owner, repoName);
@@ -465,17 +502,11 @@ export function createApp(): Server {
         if (service === 'git-upload-pack') {
           res.setHeader('content-type', 'application/x-git-upload-pack-advertisement');
           if (gitProto === 'version=2') {
-            const packets: string[] = [
-              'version 2\n',
-              'agent=makefun-forge/1.0\n',
-              'ls-refs=peel symrefs unborn\n',
-              'fetch=shallow wait-for-done filter\n',
-              'server-option\n',
-              'object-format=sha1\n',
-            ];
-            res.writeHead(200);
-            res.write(encodePktLines(packets));
-            res.end(pktLineFlush());
+            res.writeHead(200, {
+              'content-type': 'application/x-git-upload-pack-advertisement',
+              'content-length': V2_UPLOAD_PACK_ADVERTISEMENT.length,
+            });
+            res.end(V2_UPLOAD_PACK_ADVERTISEMENT);
             return;
           } else {
             // v0 upload-pack
@@ -563,6 +594,16 @@ export function createApp(): Server {
             const symrefs = lines.some((l) => l.trim() === 'symrefs');
             const peel = lines.some((l) => l.trim() === 'peel');
             const prefixes = lines.filter((l) => l.startsWith('ref-prefix ')).map((l) => l.slice(11).trim());
+            const cacheKey = `${symrefs ? 1 : 0}:${peel ? 1 : 0}:${prefixes.join(',')}`;
+            const cached = repo.lsRefsCache.get(cacheKey);
+            if (cached) {
+              res.writeHead(200, {
+                'content-type': 'application/x-git-upload-pack-result',
+                'content-length': cached.length,
+              });
+              res.end(cached);
+              return;
+            }
 
             const outPackets: Buffer[] = [];
             const defaultBranch = repo.default_branch || 'main';
@@ -590,9 +631,13 @@ export function createApp(): Server {
             }
             outPackets.push(pktLineFlush());
 
-            res.setHeader('content-type', 'application/x-git-upload-pack-result');
-            res.writeHead(200);
-            res.end(Buffer.concat(outPackets));
+            const finalBuf = Buffer.concat(outPackets);
+            repo.lsRefsCache.set(cacheKey, finalBuf);
+            res.writeHead(200, {
+              'content-type': 'application/x-git-upload-pack-result',
+              'content-length': finalBuf.length,
+            });
+            res.end(finalBuf);
             return;
           } else if (command === 'fetch') {
             const wants = lines.filter((l) => l.startsWith('want ')).map((l) => l.slice(5).trim());
@@ -606,8 +651,10 @@ export function createApp(): Server {
             if (shallowCacheKey) {
               const cachedBuf = repo.shallowPackCache.get(shallowCacheKey);
               if (cachedBuf) {
-                res.setHeader('content-type', 'application/x-git-upload-pack-result');
-                res.writeHead(200);
+                res.writeHead(200, {
+                  'content-type': 'application/x-git-upload-pack-result',
+                  'content-length': cachedBuf.length,
+                });
                 res.end(cachedBuf);
                 return;
               }
@@ -714,8 +761,10 @@ export function createApp(): Server {
             if (shallowCacheKey) {
               repo.shallowPackCache.set(shallowCacheKey, finalPackets);
             }
-            res.setHeader('content-type', 'application/x-git-upload-pack-result');
-            res.writeHead(200);
+            res.writeHead(200, {
+              'content-type': 'application/x-git-upload-pack-result',
+              'content-length': finalPackets.length,
+            });
             res.end(finalPackets);
             return;
           }
@@ -840,31 +889,32 @@ export function createApp(): Server {
         }
 
         // Process commands
-        const reportLines: Buffer[] = [
-          encodePktLine(Buffer.concat([Buffer.from([1]), Buffer.from('unpack ok\n', 'utf8')])),
-        ];
+        const reportLines: Buffer[] = [UNPACK_OK_PKT];
 
         for (const cmd of commands) {
           const currentOid = repo.refs.get(cmd.ref) || ZERO_OID;
           if (cmd.newOid === ZERO_OID) {
             // Delete ref
             repo.refs.delete(cmd.ref);
-            reportLines.push(encodePktLine(Buffer.concat([Buffer.from([1]), Buffer.from(`ok ${cmd.ref}\n`, 'utf8')])));
+            invalidateRepoCache(repo);
+            reportLines.push(encodeSideband1(`ok ${cmd.ref}\n`));
           } else if (cmd.oldOid === ZERO_OID) {
             // Create ref
             repo.refs.set(cmd.ref, cmd.newOid);
-            reportLines.push(encodePktLine(Buffer.concat([Buffer.from([1]), Buffer.from(`ok ${cmd.ref}\n`, 'utf8')])));
+            invalidateRepoCache(repo);
+            reportLines.push(encodeSideband1(`ok ${cmd.ref}\n`));
           } else {
             // Update ref: check fast-forward
             if (isFastForward(repo, cmd.oldOid, cmd.newOid)) {
               repo.refs.set(cmd.ref, cmd.newOid);
-              reportLines.push(encodePktLine(Buffer.concat([Buffer.from([1]), Buffer.from(`ok ${cmd.ref}\n`, 'utf8')])));
+              invalidateRepoCache(repo);
+              reportLines.push(encodeSideband1(`ok ${cmd.ref}\n`));
             } else {
-              reportLines.push(encodePktLine(Buffer.concat([Buffer.from([1]), Buffer.from(`ng ${cmd.ref} non-fast-forward\n`, 'utf8')])));
+              reportLines.push(encodeSideband1(`ng ${cmd.ref} non-fast-forward\n`));
             }
           }
         }
-        reportLines.push(pktLineFlush());
+        reportLines.push(PKT_FLUSH);
 
         res.setHeader('content-type', 'application/x-git-receive-pack-result');
         res.writeHead(200);
@@ -1635,6 +1685,163 @@ export function createApp(): Server {
           return;
         }
 
+        // Fast Issues API dispatch (/repos/{o}/{r}/issues...)
+        if (subPath.startsWith('issues')) {
+          if (subPath === 'issues') {
+            if (method === 'POST') {
+              const parsed = await readJsonBody(req);
+              if (!parsed.ok) {
+                sendJson(res, 400, { message: 'Problems parsing JSON' });
+                return;
+              }
+              const { title, body = '', labels: labelNames = [] } = parsed.data;
+              const attachedLabels: ForgeLabel[] = [];
+              for (const lName of labelNames) {
+                const found = repo.labels.get(lName);
+                if (!found) {
+                  sendJson(res, 422, { message: `Label ${lName} does not exist` });
+                  return;
+                }
+                attachedLabels.push(found);
+              }
+
+              const num = ++repo.issueSeq;
+              const issue: ForgeIssue = {
+                id: num,
+                number: num,
+                title,
+                body,
+                state: 'open',
+                labels: attachedLabels,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                comments: [],
+              };
+              const buf = serializeIssue(issue);
+              issue._cachedBuffer = buf;
+              repo.issues.set(num, issue);
+              res.writeHead(201, {
+                'content-type': JSON_TYPE,
+                'content-length': buf.length,
+                'x-github-request-id': getRequestId(),
+                'connection': 'keep-alive',
+              });
+              res.end(buf);
+              return;
+            }
+
+            if (method === 'GET') {
+              const stateFilter = getUrlObj().searchParams.get('state') || 'open';
+              const sort = getUrlObj().searchParams.get('sort');
+              const direction = getUrlObj().searchParams.get('direction') || 'desc';
+
+              let list = [...repo.issues.values()];
+              if (stateFilter !== 'all') {
+                list = list.filter((i) => i.state === stateFilter);
+              }
+              if (sort === 'created') {
+                list.sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
+              }
+              sendJson(res, 200, list.map((i) => ({
+                id: i.id,
+                number: i.number,
+                title: i.title,
+                body: i.body,
+                state: i.state,
+                labels: i.labels,
+              })));
+              return;
+            }
+          }
+
+          if (subPath.startsWith('issues/')) {
+            const issuePart = subPath.slice(7);
+            const slashIdx = issuePart.indexOf('/');
+            if (slashIdx === -1) {
+              const num = parseInt(issuePart, 10);
+              const issue = repo.issues.get(num);
+              if (!issue) {
+                sendJson(res, 404, { message: 'Not Found' });
+                return;
+              }
+
+              if (method === 'GET') {
+                if (issue._cachedBuffer) {
+                  res.writeHead(200, {
+                    'content-type': JSON_TYPE,
+                    'content-length': issue._cachedBuffer.length,
+                    'x-github-request-id': getRequestId(),
+                    'connection': 'keep-alive',
+                  });
+                  res.end(issue._cachedBuffer);
+                  return;
+                }
+                const buf = serializeIssue(issue);
+                issue._cachedBuffer = buf;
+                res.writeHead(200, {
+                  'content-type': JSON_TYPE,
+                  'content-length': buf.length,
+                  'x-github-request-id': getRequestId(),
+                  'connection': 'keep-alive',
+                });
+                res.end(buf);
+                return;
+              }
+
+              if (method === 'PATCH') {
+                const parsed = await readJsonBody(req);
+                if (!parsed.ok) {
+                  sendJson(res, 400, { message: 'Problems parsing JSON' });
+                  return;
+                }
+                if (parsed.data.state) issue.state = parsed.data.state;
+                if (parsed.data.title) issue.title = parsed.data.title;
+                if (parsed.data.body) issue.body = parsed.data.body;
+                issue._cachedBuffer = serializeIssue(issue);
+                sendJson(res, 200, {
+                  id: issue.id,
+                  number: issue.number,
+                  title: issue.title,
+                  body: issue.body,
+                  state: issue.state,
+                  labels: issue.labels,
+                });
+                return;
+              }
+            } else if (issuePart.slice(slashIdx + 1) === 'comments') {
+              const num = parseInt(issuePart.slice(0, slashIdx), 10);
+              const issue = repo.issues.get(num);
+              if (!issue) {
+                sendJson(res, 404, { message: 'Not Found' });
+                return;
+              }
+
+              if (method === 'POST') {
+                const parsed = await readJsonBody(req);
+                if (!parsed.ok) {
+                  sendJson(res, 400, { message: 'Problems parsing JSON' });
+                  return;
+                }
+                const commentId = ++repo.commentsSeq;
+                const comment: ForgeComment = {
+                  id: commentId,
+                  body: parsed.data.body || '',
+                  created_at: new Date().toISOString(),
+                  user: store.viewer,
+                };
+                issue.comments.push(comment);
+                sendJson(res, 201, { id: comment.id, body: comment.body });
+                return;
+              }
+
+              if (method === 'GET') {
+                sendJson(res, 200, issue.comments.map((c) => ({ id: c.id, body: c.body })));
+                return;
+              }
+            }
+          }
+        }
+
         // GET /repos/{o}/{r}
         if (subPath === '' && method === 'GET') {
           sendJson(res, 200, {
@@ -1911,164 +2118,6 @@ export function createApp(): Server {
           repo.labels.set(name, label);
           sendJson(res, 201, label);
           return;
-        }
-
-        // Issues API: POST & GET /repos/{o}/{r}/issues
-        if (subPath === 'issues') {
-          if (method === 'POST') {
-            const parsed = await readJsonBody(req);
-            if (!parsed.ok) {
-              sendJson(res, 400, { message: 'Problems parsing JSON' });
-              return;
-            }
-            const { title, body = '', labels: labelNames = [] } = parsed.data;
-            // Validate labels
-            const attachedLabels: ForgeLabel[] = [];
-            for (const lName of labelNames) {
-              const found = repo.labels.get(lName);
-              if (!found) {
-                sendJson(res, 422, { message: `Label ${lName} does not exist` });
-                return;
-              }
-              attachedLabels.push(found);
-            }
-
-            const num = ++repo.issueSeq;
-            const issue: ForgeIssue = {
-              id: num,
-              number: num,
-              title,
-              body,
-              state: 'open',
-              labels: attachedLabels,
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-              comments: [],
-            };
-            const buf = serializeIssue(issue);
-            issue._cachedBuffer = buf;
-            repo.issues.set(num, issue);
-            res.writeHead(201, {
-              'content-type': JSON_TYPE,
-              'content-length': buf.length,
-              'x-github-request-id': getRequestId(),
-              'connection': 'keep-alive',
-            });
-            res.end(buf);
-            return;
-          }
-
-          if (method === 'GET') {
-            const stateFilter = getUrlObj().searchParams.get('state') || 'open';
-            const sort = getUrlObj().searchParams.get('sort');
-            const direction = getUrlObj().searchParams.get('direction') || 'desc';
-
-            let list = [...repo.issues.values()];
-            if (stateFilter !== 'all') {
-              list = list.filter((i) => i.state === stateFilter);
-            }
-            if (sort === 'created') {
-              list.sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
-            }
-            sendJson(res, 200, list.map((i) => ({
-              id: i.id,
-              number: i.number,
-              title: i.title,
-              body: i.body,
-              state: i.state,
-              labels: i.labels,
-            })));
-            return;
-          }
-        }
-
-        // Issue detail: /repos/{o}/{r}/issues/{number}
-        const issueMatch = subPath.match(/^issues\/(\d+)$/);
-        if (issueMatch) {
-          const num = parseInt(issueMatch[1], 10);
-          const issue = repo.issues.get(num);
-          if (!issue) {
-            sendJson(res, 404, { message: 'Not Found' });
-            return;
-          }
-
-          if (method === 'GET') {
-            if (issue._cachedBuffer) {
-              res.writeHead(200, {
-                'content-type': JSON_TYPE,
-                'content-length': issue._cachedBuffer.length,
-                'x-github-request-id': getRequestId(),
-                'connection': 'keep-alive',
-              });
-              res.end(issue._cachedBuffer);
-              return;
-            }
-            const buf = serializeIssue(issue);
-            issue._cachedBuffer = buf;
-            res.writeHead(200, {
-              'content-type': JSON_TYPE,
-              'content-length': buf.length,
-              'x-github-request-id': getRequestId(),
-              'connection': 'keep-alive',
-            });
-            res.end(buf);
-            return;
-          }
-
-          if (method === 'PATCH') {
-            const parsed = await readJsonBody(req);
-            if (!parsed.ok) {
-              sendJson(res, 400, { message: 'Problems parsing JSON' });
-              return;
-            }
-            if (parsed.data.state) issue.state = parsed.data.state;
-            if (parsed.data.title) issue.title = parsed.data.title;
-            if (parsed.data.body) issue.body = parsed.data.body;
-            issue._cachedBuffer = serializeIssue(issue);
-            sendJson(res, 200, {
-              id: issue.id,
-              number: issue.number,
-              title: issue.title,
-              body: issue.body,
-              state: issue.state,
-              labels: issue.labels,
-            });
-            return;
-          }
-        }
-
-        // Comments: /repos/{o}/{r}/issues/{number}/comments
-        const commentsMatch = subPath.match(/^issues\/(\d+)\/comments$/);
-        if (commentsMatch) {
-          const num = parseInt(commentsMatch[1], 10);
-          const issue = repo.issues.get(num);
-          if (!issue) {
-            sendJson(res, 404, { message: 'Not Found' });
-            return;
-          }
-
-          if (method === 'POST') {
-            const parsed = await readJsonBody(req);
-            if (!parsed.ok) {
-              sendJson(res, 400, { message: 'Problems parsing JSON' });
-              return;
-            }
-            const commentId = ++repo.commentsSeq;
-            const comment: ForgeComment = {
-              id: commentId,
-              body: parsed.data.body || '',
-              created_at: new Date().toISOString(),
-              user: store.viewer,
-            };
-            issue.comments.push(comment);
-            sendJson(res, 201, { id: comment.id, body: comment.body });
-            return;
-          }
-
-          if (method === 'GET') {
-            sendJson(res, 200, issue.comments.map((c) => ({ id: c.id, body: c.body })));
-            return;
-          }
         }
 
         // Pull Requests: /repos/{o}/{r}/pulls

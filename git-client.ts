@@ -890,7 +890,7 @@ export function writePack(objects: Iterable<GitObjectInput>): Buffer {
   for (const object of list) {
     const data = asBuffer(object.data);
     parts.push(writePackObjectHeader(object.type, data.length));
-    parts.push(deflateSync(data));
+    parts.push(deflateSync(data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);

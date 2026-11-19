@@ -69,7 +69,7 @@ async function runEntrypoint(): Promise<void> {
   const appServer = createApp();
   await new Promise<void>((resolve, reject) => {
     appServer.once('error', reject);
-    appServer.listen(0, () => resolve());
+    appServer.listen(0, '127.0.0.1', () => resolve());
   });
 
   const boundAddr = appServer.address();
