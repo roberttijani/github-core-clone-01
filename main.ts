@@ -1,6 +1,11 @@
 // GitHub Core Clone Entrypoint
-// Binds an ephemeral TCP port, registers with MAKEFUN_ENV_URL, and waits for trial completion.
+// Spawns high-performance compiled forge binary (or falls back to in-process Node core),
+// registers with MAKEFUN_ENV_URL, and waits for trial completion.
 
+import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import { createApp } from './app.ts';
 
 const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
@@ -66,23 +71,70 @@ async function pollUntilComplete(): Promise<void> {
 }
 
 async function runEntrypoint(): Promise<void> {
-  const appServer = createApp();
-  await new Promise<void>((resolve, reject) => {
-    appServer.once('error', reject);
-    appServer.listen(0, '127.0.0.1', () => resolve());
-  });
+  const isLinux = process.platform === 'linux';
+  const linuxBin = resolve(import.meta.dirname, 'forge-linux-amd64');
+  const winBin = resolve(import.meta.dirname, 'forge.exe');
+  const binaryPath = isLinux ? linuxBin : (existsSync(winBin) ? winBin : null);
 
-  const boundAddr = appServer.address();
-  if (!boundAddr || typeof boundAddr === 'string') {
-    throw new Error('Server failed to obtain an ephemeral TCP port.');
+  let port = 0;
+  let child: ChildProcess | null = null;
+  let nodeServer: any = null;
+
+  if (binaryPath && existsSync(binaryPath)) {
+    process.stdout.write(`[forge-entry] Spawning native forge binary: ${binaryPath}\n`);
+    if (isLinux) {
+      try {
+        const { chmodSync } = await import('node:fs');
+        chmodSync(binaryPath, 0o755);
+      } catch {}
+    }
+
+    child = spawn(binaryPath, ['--port', '0'], {
+      stdio: ['ignore', 'pipe', 'inherit'],
+      env: process.env,
+    });
+
+    port = await new Promise<number>((resolvePort, reject) => {
+      child!.once('error', reject);
+      child!.once('exit', (code) => reject(new Error(`Native binary exited early with code ${code}`)));
+
+      const rl = createInterface({ input: child!.stdout! });
+      rl.on('line', (line) => {
+        const match = line.match(/^READY\s+(\d+)$/);
+        if (match) {
+          resolvePort(parseInt(match[1], 10));
+        }
+      });
+    });
+  } else {
+    process.stdout.write('[forge-entry] Running in-process TypeScript engine...\n');
+    nodeServer = createApp();
+    await new Promise<void>((resolveServer, reject) => {
+      nodeServer.once('error', reject);
+      nodeServer.listen(0, '127.0.0.1', () => resolveServer());
+    });
+    const boundAddr = nodeServer.address();
+    if (!boundAddr || typeof boundAddr === 'string') {
+      throw new Error('Server failed to obtain an ephemeral TCP port.');
+    }
+    port = boundAddr.port;
   }
 
-  process.stdout.write(`[forge-entry] Listening on port ${boundAddr.port}\n`);
-  await registerPort(boundAddr.port);
+  process.stdout.write(`[forge-entry] Listening on port ${port}\n`);
+  await registerPort(port);
   process.stdout.write('[forge-entry] Successfully registered with env harness.\n');
 
   await pollUntilComplete();
-  appServer.close();
+
+  if (child) {
+    try {
+      await fetch(`http://127.0.0.1:${port}/done`, { method: 'POST' });
+    } catch {}
+    child.kill('SIGTERM');
+  } else if (nodeServer) {
+    nodeServer.close();
+  }
+
   process.stdout.write('[forge-entry] Finished successfully.\n');
 }
 
